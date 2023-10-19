@@ -1,2 +1,6 @@
 chardet
 unidecode
+pytorch
+torchvision
+cudatoolkit
+transformers
