@@ -392,8 +392,8 @@ class Main:
         # scheduler = StepLR(optimizer, step_size=1, gamma=1.03)
         scheduler = get_constant_schedule_with_warmup(optimizer, self.configuration['warmup_steps'])
 
-        train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.batch_size)
-        eval_dataloader = DataLoader(self.eval_dataset, batch_size=self.batch_size, num_workers=self.batch_size)
+        train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4)
+        eval_dataloader = DataLoader(self.eval_dataset, batch_size=self.batch_size, num_workers=4)
 
         training_loop = TrainingLoop(
             model=self.model, processor=self.processor, optimizer=optimizer, device=device, lr=self.configuration['learning_rate'],
