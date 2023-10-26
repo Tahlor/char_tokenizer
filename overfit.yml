@@ -1,0 +1,19 @@
+#constant_warmup: false - Example for boolean
+
+iam_filepath: /content/drive/MyDrive/Research 497/IMAT Data/TestImages
+image_directory: /content/drive/MyDrive/Research 497/IMAT Data/IAM/TestImages/
+train_label_directory: /content/drive/MyDrive/Research 497/IMAT Data/IAM/test-image-label.txt
+test_label_directory: /content/drive/MyDrive/Research 497/IMAT Data/IAM/test-image-label.txt
+pretrained_model: microsoft/trocr-small-handwritten
+pretrained_processor: microsoft/trocr-small-handwritten
+token_id: 0
+num_epochs: 250
+batch_size: 1
+learning_rate: 5e-2
+warmup_steps: 15000
+image_height: 384
+image_width: 384
+use_learned_embeddings: false
+
+
+

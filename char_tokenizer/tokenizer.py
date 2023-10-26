@@ -12,6 +12,7 @@ import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+
 class CharacterTokenizer(PreTrainedTokenizer):
     def __init__(self, characters: Sequence[str], model_max_length: int, **kwargs):
         """Character tokenizer for Hugging Face transformers.
@@ -82,6 +83,8 @@ class CharacterTokenizer(PreTrainedTokenizer):
         return self._vocab_str_to_int.get(token, self._vocab_str_to_int["[UNK]"])
 
     def _convert_id_to_token(self, index: int) -> str:
+        if index > len(self._vocab_int_to_str):
+          return self._vocab_int_to_str[6]
         return self._vocab_int_to_str[index]
 
     def convert_tokens_to_string(self, tokens):
@@ -151,6 +154,7 @@ class CharacterTokenizer(PreTrainedTokenizer):
         with open(cfg_file) as f:
             cfg = json.load(f)
         return cls.from_config(cfg)
+
 
 if __name__ == "__main__":
     # Initialize tokenizer
