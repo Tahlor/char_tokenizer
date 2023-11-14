@@ -19,6 +19,7 @@ from unidecode import unidecode
 from transformers import PreTrainedTokenizerBase, BatchEncoding
 from typing import List, Union, Dict, Optional, Tuple
 import logging
+import gc
 
 from transformers import (
     RobertaTokenizer,
@@ -42,7 +43,7 @@ def read_vocab(vocab="vocab.txt"):
 
 
 def get_model_and_proc(configurations):
-
+    vocab = read_vocab()
     encoder_config = ViTConfig(image_size=384, qkv_bias=False)
     image_processor = ViTImageProcessor(size=encoder_config.image_size)
     tokenizer = CharacterTokenizer(vocab, model_max_length=128)
@@ -252,7 +253,7 @@ class IAMDataset(Dataset):
         labels = self.processor.tokenizer(
             text, padding="max_length", max_length=self.max_target_length).input_ids
         # important: make sure that PAD tokens are ignored by the loss function
-        labels = [label if label != self.processor.tokenizer.pad_token_id else -100 for label in labels]
+        labels = np.array([label if label != self.processor.tokenizer.pad_token_id else -100 for label in labels])
 
         encoding = {"pixel_values": pixel_values.squeeze(), "labels": torch.tensor(labels)}
         return encoding
@@ -317,9 +318,10 @@ class TrainingLoop:
             print(f'Epoch is {epoch}')
             train_loss = 0.0
             self.model.train()
-
+            i = 0
             for batch in train_dataloader:
-
+                i = i + 1
+                print(i)
                 for k, v in batch.items():
                     batch[k] = v.to(self.device)
 
@@ -330,10 +332,10 @@ class TrainingLoop:
                 loss.backward()
                 self.optimizer.step()
 
-                train_loss += loss.item()
+                train_loss += loss.detach().item()
 
                 self.scheduler.step()
-
+                gc.collect()
             print(f"Epoch {epoch} Loss: ", train_loss / len(train_dataloader))
 
             # Evaluate on eval set every 5 epochs
@@ -356,7 +358,7 @@ class TrainingLoop:
                 self.cer_validation_arr.append(valid_norm)
 
                 self.print_train_cer(train_dataloader)
-        self.model.save_pretrained(".")
+        self.model.save_pretrained("/home/sdslinn/home/models/")
 
 
 class Main:
@@ -392,8 +394,8 @@ class Main:
         # scheduler = StepLR(optimizer, step_size=1, gamma=1.03)
         scheduler = get_constant_schedule_with_warmup(optimizer, self.configuration['warmup_steps'])
 
-        train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4)
-        eval_dataloader = DataLoader(self.eval_dataset, batch_size=self.batch_size, num_workers=4)
+        train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=6)
+        eval_dataloader = DataLoader(self.eval_dataset, batch_size=self.batch_size, num_workers=6)
 
         training_loop = TrainingLoop(
             model=self.model, processor=self.processor, optimizer=optimizer, device=device, lr=self.configuration['learning_rate'],
@@ -404,7 +406,7 @@ class Main:
 
 
 if __name__ == "__main__":
-    with open('training.yml') as config_file:
+    with open('/home/sdslinn/home/training.yml') as config_file:
         configs = yaml.load(config_file, Loader=yaml.FullLoader)
 
     configs['learning_rate'] = float(configs['learning_rate'])
