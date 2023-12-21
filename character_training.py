@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, Dataset
 import evaluate
 import numpy as np
 import yaml
+import argparse
 
 import json
 import os
@@ -20,6 +21,7 @@ from transformers import PreTrainedTokenizerBase, BatchEncoding
 from typing import List, Union, Dict, Optional, Tuple
 import logging
 import gc
+import sys
 
 from transformers import (
     RobertaTokenizer,
@@ -58,6 +60,9 @@ def get_model_and_proc(configurations):
     config.max_length = 75
 
     model = VisionEncoderDecoderModel.from_pretrained(configurations['pretrained_model'], config=config, ignore_mismatched_sizes=True)
+    if configurations['load_model']:
+        state = torch.load(configurations['load_model_path'])
+        model.load_state_dict(state['model_state_dict'])
     return model, processor
 
 
@@ -259,9 +264,58 @@ class IAMDataset(Dataset):
         return encoding
 
 
+class SynthDataset(Dataset):
+    def __init__(self, root_dir, label_file, processor, max_target_length=128):
+        self.root_dir = root_dir
+        rows = []
+        if label_file.endswith('json'):
+            with open(label_file, 'r') as f:
+                data = json.load(f)
+                for file_name, file_data in data.items():
+                    row = {'file_name': file_name, 'text': file_data['text']}
+                    rows.append(row)
+        else:
+            path = Path(label_file)
+            data = np.load(path, allow_pickle=True).item()
+            rows = []
+            for file_name, file_data in data.items():
+                row = {'file_name': file_data['ImageName'], 'text': file_data['Paragraph_orig']}
+                rows.append(row)
+
+        # Create a DataFrame from the list of dictionaries
+        self.df = pd.DataFrame(rows)
+
+        self.processor = processor
+        self.max_target_length = max_target_length
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        # get file name + text
+        file_name = self.df['file_name'][idx]
+        text = self.df['text'][idx]
+        # some file names end with jp instead of jpg, the two lines below fix this
+        if file_name.endswith('jp'):
+            file_name = file_name + 'g'
+        if not file_name.endswith('.jpg'):
+            file_name = file_name + '.jpg'
+        # prepare image (i.e. resize + normalize)
+        image = Image.open(self.root_dir + file_name).convert("RGB")
+        pixel_values = self.processor(image, return_tensors="pt").pixel_values
+        # add labels (input_ids) by encoding the text
+        labels = self.processor.tokenizer(
+            text, padding="max_length", max_length=self.max_target_length).input_ids
+        # important: make sure that PAD tokens are ignored by the loss function
+        labels = np.array([label if label != self.processor.tokenizer.pad_token_id else -100 for label in labels])
+
+        encoding = {"pixel_values": pixel_values.squeeze(), "labels": torch.tensor(labels)}
+        return encoding
+
+
 class TrainingLoop:
 
-    def __init__(self, model, processor, optimizer, device, lr, scheduler, num_epochs):
+    def __init__(self, model, processor, optimizer, device, lr, scheduler, num_epochs, synth_epochs, num_synth_images):
 
         self.model = model
         self.processor = processor
@@ -270,6 +324,8 @@ class TrainingLoop:
         self.device = device
         self.scheduler = scheduler
         self.num_epochs = num_epochs
+        self.synth_epochs = synth_epochs
+        self.num_synth_images = num_synth_images
 
         self.losses_arr = []
         self.cer_validation_arr = []
@@ -291,7 +347,7 @@ class TrainingLoop:
         self.model.eval()
         cers = []
         with torch.no_grad():
-            for batch in dataloader:
+            for index, batch in enumerate(dataloader):
                 # run batch generation
                 outputs = self.model.generate(
                     batch["pixel_values"].to(self.device))
@@ -299,6 +355,8 @@ class TrainingLoop:
                 cer = self.compute_cer(pred_ids=outputs,
                                        label_ids=batch["labels"])
                 cers.append(cer)
+                if index > 10000:
+                    break
 
         valid_norm = np.sum(cers) / len(cers)
         print(f"{eval_or_train}: ", valid_norm)
@@ -310,9 +368,63 @@ class TrainingLoop:
     def print_train_cer(self, train_dataloader):
         self.print_cer(train_dataloader, "TRAIN CER")
 
-    def train(self, train_dataloader, eval_dataloader):
-        self.print_eval_cer(eval_dataloader)
-        self.print_train_cer(train_dataloader)
+    def print_synth_cer(self, synth_dataloader):
+        self.print_cer(synth_dataloader, 'SYNTH CER')
+
+    def train(self, synth_dataloader, train_dataloader, eval_dataloader):
+        # self.print_eval_cer(eval_dataloader)
+        # self.print_train_cer(train_dataloader)
+
+        for synth_epoch in range(self.synth_epochs):
+            print(f'Synth Epoch is {synth_epoch}')
+            synth_loss = 0.0
+            self.model.train()
+            epoch_index = 1
+            for index, batch in enumerate(synth_dataloader):
+                for k, v in batch.items():
+                    batch[k] = v.to(self.device)
+                print(batch['pixel_values'])
+                outputs = self.model(**batch)
+                loss = outputs.loss
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                synth_loss += loss.detach().item()
+                self.scheduler.step()
+                gc.collect()
+                if index % 5 == 0:
+                    print(index)
+                epoch_index = index
+                if index > self.num_synth_images:
+                    break
+            torch.save(
+                {
+                    'epoch': epoch_index,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'loss': synth_loss
+                }, "/home/sdslinn/home/models/recent/test_model"
+            )
+            print(f"Synth Epoch {synth_epoch} Loss: ", synth_loss / epoch_index)
+
+            # Evaluate on eval set every 5 epochs
+
+            if synth_epoch % 5 == 0:
+                self.model.eval()
+                valid_cer = []
+                with torch.no_grad():
+                    for batch in eval_dataloader:
+                        # run batch generation
+                        outputs = self.model.generate(
+                            batch["pixel_values"].to(self.device))
+                        # compute metrics
+                        cer = self.compute_cer(pred_ids=outputs, label_ids=batch["labels"])
+                        valid_cer.append(cer)
+
+                valid_norm = np.sum(valid_cer) / len(valid_cer)
+                print(f"Synth Validation CER: {valid_norm}, synth_epoch: {synth_epoch}")
+                self.cer_validation_arr.append(valid_norm)
+                self.print_synth_cer(synth_dataloader)
 
         for epoch in range(self.num_epochs):
             print(f'Epoch is {epoch}')
@@ -339,7 +451,6 @@ class TrainingLoop:
             print(f"Epoch {epoch} Loss: ", train_loss / len(train_dataloader))
 
             # Evaluate on eval set every 5 epochs
-
             if epoch % 5 == 0:
                 self.model.eval()
 
@@ -358,7 +469,14 @@ class TrainingLoop:
                 self.cer_validation_arr.append(valid_norm)
 
                 self.print_train_cer(train_dataloader)
-        self.model.save_pretrained("/home/sdslinn/home/models/")
+            torch.save(
+                {
+                    'epoch': epoch_index,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'loss': synth_loss
+                }, "/home/sdslinn/home/models/recent/test_model"
+            )
 
 
 class Main:
@@ -367,6 +485,8 @@ class Main:
         self.__dict__.update(locals())
         self.model, self.processor = get_model_and_proc(self.configuration)
         image_directory = self.configuration['image_directory']
+        synth_directory = self.configuration['synth_directory']
+        synth_labels = self.configuration['synth_labels']
 
         train_df = new_iam_df(self.configuration['train_label_directory'])
         print(train_df.head())
@@ -376,11 +496,19 @@ class Main:
             root_dir=image_directory, df=train_df, processor=self.processor
         )
         self.train_dataset = train_dataset
+
         eval_dataset = IAMDataset(
             root_dir=image_directory, df=test_df, processor=self.processor
         )
         self.eval_dataset = eval_dataset
+
+        synth_dataset = SynthDataset(
+            root_dir=synth_directory, label_file=synth_labels, processor=self.processor,
+        )
+        self.synth_dataset = synth_dataset
+
         self.batch_size = self.configuration['batch_size']
+        self.num_workers = self.configuration['num_workers']
 
     def train(self):
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -393,20 +521,25 @@ class Main:
 
         # scheduler = StepLR(optimizer, step_size=1, gamma=1.03)
         scheduler = get_constant_schedule_with_warmup(optimizer, self.configuration['warmup_steps'])
-
-        train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=6)
-        eval_dataloader = DataLoader(self.eval_dataset, batch_size=self.batch_size, num_workers=6)
+        synth_dataloader = DataLoader(self.synth_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+        train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+        eval_dataloader = DataLoader(self.eval_dataset, batch_size=self.batch_size, num_workers=self.num_workers)
 
         training_loop = TrainingLoop(
             model=self.model, processor=self.processor, optimizer=optimizer, device=device, lr=self.configuration['learning_rate'],
-            scheduler=scheduler, num_epochs=self.configuration['num_epochs']
+            scheduler=scheduler, num_epochs=self.configuration['num_epochs'], synth_epochs=self.configuration['synth_epochs'], num_synth_images=self.configuration['num_synth_images']
         )
         print('Starting training \n')
-        training_loop.train(train_dataloader, eval_dataloader)
+        training_loop.train(synth_dataloader, train_dataloader, eval_dataloader)
 
 
 if __name__ == "__main__":
-    with open('/home/sdslinn/home/training.yml') as config_file:
+    parser = argparse.ArgumentParser(description="Run Synth training set.")
+    parser.add_argument("--yml_file", '-f', help="YML file with settings")
+
+    args = parser.parse_args()
+
+    with open(f'/home/sdslinn/home/{args.yml_file}') as config_file:
         configs = yaml.load(config_file, Loader=yaml.FullLoader)
 
     configs['learning_rate'] = float(configs['learning_rate'])
@@ -416,6 +549,9 @@ if __name__ == "__main__":
     configs['batch_size'] = int(configs['batch_size'])
     configs['warmup_steps'] = int(configs['warmup_steps'])
     configs['token_id'] = int(configs['token_id'])
-
+    configs['num_workers'] = int(configs['num_workers'])
+    configs['synth_epochs'] = int(configs['synth_epochs'])
+    configs['num_synth_images'] = int(configs['num_synth_images'])
+    print(configs)
     main = Main(configs)
     main.train()
